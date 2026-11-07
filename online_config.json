@@ -1,0 +1,91 @@
+{
+  "task_m": 4,
+  "method": "Aug_FB_TRCA",
+  "fs": 2000,
+  "window_size": 200,
+  "decimation": 2,
+  "eeg_channels": [
+    0,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "enable_rereference": true,
+  "reference_channels": [
+    1,
+    7
+  ],
+  "enable_notch": true,
+  "notch_hz": 50.0,
+  "notch_q": 30.0,
+  "filter_order": 4,
+  "bands": [
+    [
+      5.0,
+      95.0
+    ],
+    [
+      12.0,
+      95.0
+    ],
+    [
+      19.0,
+      95.0
+    ],
+    [
+      27.0,
+      95.0
+    ],
+    [
+      35.0,
+      95.0
+    ],
+    [
+      43.0,
+      95.0
+    ],
+    [
+      51.0,
+      95.0
+    ],
+    [
+      59.0,
+      95.0
+    ],
+    [
+      67.0,
+      95.0
+    ],
+    [
+      75.0,
+      95.0
+    ]
+  ],
+  "training_blocks": 10,
+  "max_extra_blocks": 2,
+  "train_cue_seconds": [
+    3.0,
+    5.0
+  ],
+  "skip_seconds": 0.5,
+  "min_samples": 20,
+  "online_mode": "cued",
+  "online_seconds": 120.0,
+  "test_warmup_seconds": 0.5,
+  "online_cue_seconds": [
+    3.0,
+    5.0
+  ],
+  "feedback": true,
+  "refresh_rate": 120,
+  "frequency": 10.0,
+  "ring_seconds": 60.0,
+  "catchup_max_seconds": 0.02,
+  "catchup_hold_seconds": 0.25,
+  "max_prediction_lag_seconds": 0.1,
+  "fit_timeout_seconds": 45.0,
+  "no_data_timeout_seconds": 3.0,
+  "seed": 20261104
+}

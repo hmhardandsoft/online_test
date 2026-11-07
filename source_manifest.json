@@ -1,0 +1,16 @@
+{
+  "source": "0710 working tree snapshot, 2026-11-07",
+  "sha256": {
+    "online_experiment.py": "7cc96ae96dee4a9faf686338c83976a693f6218aaeae4591c6d2fee05210316d",
+    "online_core.py": "aa37bf198fc0418081b0922bc8380d107146127184234072291d78648cd11d37",
+    "online_config.json": "7314e3d4bca98b60bb169bc5c5d4b2e4b3301d66e922556296eb0f3398d3ebc2",
+    "SSVEP_stimulator.py": "0431abdc4d83e1648a104ba4aaed58d6e7791cda59dbca68c12505a4d074084c",
+    "SSVEP_decoder.py": "7b76b494364299f5981ba27ea2a6c9d8d5e68a666f42cc34546a02db15b7efb9",
+    "SSVEP_recorder.py": "cc96265a4480d055c0acbc381c8b6e173e597dc3d5fe2e3380996a0bc1f86729",
+    "util.py": "0cfeb3922f2032695c1da12daf84f7e413f972a36e7af7ed9a171d22f079789c",
+    "usb_acquisition_benchmark.py": "0311b8a6a3b609a644bd2da4d1d13b8298ca35c34cc86b692a2667d2d995f620",
+    "test_online_experiment.py": "0c2750f1389059f3287d4728aa8a04bfadf3c19e287ad0bd71c39358d05b1836",
+    "verify_online_runs.py": "a31dd12401e2886d30e1293764d1641c7c72e4d1212cb93f8b54175304abe14f",
+    "switch_event/label_switch_accuracy_analysis_1.py": "83b3a880c324ba872b73a9dda3e650d678b6c2fd3e23272bf6bb8ba3831e0ecb"
+  }
+}

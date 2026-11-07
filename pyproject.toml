@@ -1,0 +1,20 @@
+[project]
+name = "ssvep-online"
+version = "0.1.0"
+description = "Same-frequency phase-coded SSVEP experiment scripts"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "econexg @ git+https://github.com/Niantong-Intelligence/eConEXG.git@ff7f447906eaf9df540ddaf44fa48934544ed478",
+    "glfw>=2.8,<3",
+    "numpy>=1.26,<3",
+    "joblib==1.5.3",
+    "threadpoolctl==3.6.0",
+    "pyopengl>=3.1,<4",
+    "pyqt5==5.15.9",
+    "pyqt5-qt5==5.15.2",
+    "pyqt5-sip>=12.18.0",
+    "scikit-learn>=1.4,<2",
+    "scipy>=1.13,<2",
+    "sip>=6.15.3",
+    "tqdm>=4.66,<5",
+]
