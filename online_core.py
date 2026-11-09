@@ -23,7 +23,7 @@ LABEL, TRAIN_VALID, STAGE, SEGMENT, VALID, INTENSITY = range(6)
 
 def metadata_columns(task_m):
     return ["label", "train_valid", "stage", "segment", "valid",
-            *[f"intensity_{i+1}" for i in range(task_m)], "stimulus_id", "stimulus_frame"]
+            *[f"intensity_{i+1}" for i in range(task_m)], "stimulus_id", "stimulus_frame", "test_id"]
 
 
 @dataclass
@@ -50,17 +50,19 @@ class Config:
     min_samples: int = 20
     online_mode: str = "cued"
     online_seconds: float = 120.
+    online_stop_mode: str = "time"
+    online_cue_count: int = 30
     online_cue_seconds: tuple = (3., 5.)
     test_warmup_seconds: float = .5
     feedback: bool = True
     timing_diagnostics: bool = True
     refresh_rate: int = 120
     frequency: float = 10.
-    ring_seconds: float = 60.
+    ring_seconds: float = 120.
     catchup_max_seconds: float = .02
     catchup_hold_seconds: float = .25
     max_prediction_lag_seconds: float = .1
-    fit_timeout_seconds: float = 45.
+    fit_timeout_seconds: float = 90.
     no_data_timeout_seconds: float = 3.
     seed: int = 20261104
 
@@ -87,6 +89,10 @@ class Config:
             raise ValueError("Invalid training counts")
         if self.online_mode not in ("cued", "uncued") or self.online_seconds <= 0:
             raise ValueError("Invalid online mode/duration")
+        if self.online_stop_mode not in ("time", "segments") or self.online_cue_count < 1:
+            raise ValueError("Invalid online stop mode or cue count")
+        if self.online_mode == "uncued" and self.online_stop_mode != "time":
+            raise ValueError("Uncued tests require time stop mode")
         if not np.isfinite(self.test_warmup_seconds) or self.test_warmup_seconds < 0:
             raise ValueError("test_warmup_seconds must be finite and nonnegative")
         for limits in (self.train_cue_seconds, self.online_cue_seconds):
@@ -148,6 +154,8 @@ class Epoch:
     segment: int
     training: bool
     online: bool
+    test_id: int = 0
+    stimulus_id: int = 0
 
 
 class EpochStream:
@@ -213,7 +221,9 @@ The window [edge-100, edge+100) becomes available only after its last raw sample
             # Cues may change inside an online window. Black screens, restarts
             # and calibration data may not. Late warmup data can seed online.
             online = bool(same_stimulus and center[STAGE] == ONLINE
-                          and np.all(np.isin(rows[:, STAGE], (WARMUP, ONLINE))))
+                          and np.all(np.isin(rows[:, STAGE], (WARMUP, ONLINE)))
+                          and center[stimulus_col+2] > 0
+                          and np.all(rows[:, stimulus_col+2] == center[stimulus_col+2]))
             if not (training or online):
                 continue
             a, b = np.searchsorted(self.ds_indices, (start, stop))
@@ -221,7 +231,8 @@ The window [edge-100, edge+100) becomes available only after its last raw sample
             if x.shape[-1] != cfg.window_size // cfg.decimation:
                 raise RuntimeError("Decimation/window alignment lost")
             result.append(Epoch(edge, edge_sample, start, stop, x,
-                                int(center[LABEL])-1, int(center[SEGMENT]), training, online))
+                                int(center[LABEL])-1, int(center[SEGMENT]), training, online,
+                                int(center[stimulus_col+2]), int(center[stimulus_col])))
         retain = max(0, self.total - cfg.window_size - cfg.decimation)
         self.meta = self.meta[retain-self.raw_base:]
         self.raw_base = retain
@@ -345,6 +356,24 @@ class EdgeModelBank:
         if not np.isfinite(scores).all():
             raise ValueError("Nonfinite model scores")
         return int(np.argmax(scores)), scores
+
+
+def fit_all_methods(training_bank):
+    """Fit three frozen models from the same collected epochs and class counts."""
+    from dataclasses import replace
+    if training_bank.frozen or not training_bank.ready():
+        raise RuntimeError("Training data are not complete")
+    models = {}
+    # Keep LDA last because its covariance matrices dominate fit memory.
+    for method in ("Aug_FB_TRCA", "Aug_FB_eTRCA", "Aug_FB_LDA"):
+        bank = EdgeModelBank(replace(training_bank.cfg, method=method))
+        bank.samples, bank.labels = training_bank.samples, training_bank.labels
+        bank.counts = training_bank.counts.copy()
+        bank.training_index = training_bank.training_index
+        models[method] = bank.fit()
+    training_bank.samples = training_bank.labels = None
+    training_bank.frozen = True
+    return models
 
 
 def time_accuracy(cues, predictions, start, stop, cued=True):

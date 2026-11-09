@@ -81,12 +81,14 @@
   "feedback": true,
   "refresh_rate": 120,
   "frequency": 10.0,
-  "ring_seconds": 60.0,
+  "ring_seconds": 120.0,
   "catchup_max_seconds": 0.02,
   "catchup_hold_seconds": 0.25,
   "max_prediction_lag_seconds": 0.1,
-  "fit_timeout_seconds": 45.0,
+  "fit_timeout_seconds": 90.0,
   "no_data_timeout_seconds": 3.0,
   "seed": 20261104,
-  "timing_diagnostics": true
+  "timing_diagnostics": true,
+  "online_stop_mode": "time",
+  "online_cue_count": 30
 }

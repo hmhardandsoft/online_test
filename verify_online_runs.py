@@ -1,99 +1,117 @@
-"""Run all six synthetic process-level combinations plus uncued mode, no hardware."""
+"""Process-level synthetic checks for one calibration and three independent tests."""
+import csv
 import json
 from pathlib import Path
 import subprocess
 import sys
 from datetime import datetime
 from uuid import uuid4
+
+import joblib
 import numpy as np
-import csv
-from online_core import (Config, METHODS, INTENSITY, LABEL, STAGE, SEGMENT, TRAIN_VALID, VALID,
-                         TRAIN, ONLINE, WARMUP, metadata_columns)
+
+from online_core import (Config, METHODS, INTENSITY, LABEL, STAGE, SEGMENT,
+                         TRAIN_VALID, VALID, TRAIN, metadata_columns, time_accuracy)
 from online_experiment import write_json
+
+
+def check_case(root, output, m, mode, stop_mode):
+    output.mkdir(parents=True)
+    cfg = Config(task_m=m, training_blocks=1, max_extra_blocks=0,
+                 train_cue_seconds=(1., 1.), skip_seconds=.2, min_samples=5,
+                 online_mode=mode, online_stop_mode=stop_mode,
+                 online_seconds=1.2, online_cue_count=3,
+                 online_cue_seconds=(.3, .4), test_warmup_seconds=.2,
+                 refresh_rate=600, timing_diagnostics=True)
+    config_path = output/'config.json'
+    destination = output/'run'
+    write_json(config_path, cfg.to_dict())
+    run = subprocess.run([sys.executable, str(root/'online_experiment.py'),
+                          '--config', str(config_path), '--simulate', '--headless',
+                          '--output', str(destination)], cwd=root,
+                         capture_output=True, text=True, timeout=180)
+    (output/'run.log').write_text(run.stdout+run.stderr, encoding='utf-8')
+    if run.returncode:
+        raise RuntimeError(run.stdout+'\n'+run.stderr)
+    summary = json.loads((destination/'summary.json').read_text(encoding='utf-8'))
+    training = json.loads((destination/'training.json').read_text(encoding='utf-8'))
+    predictions = json.loads((destination/'predictions.json').read_text(encoding='utf-8'))
+    events = json.loads((destination/'events.json').read_text(encoding='utf-8'))
+    with (destination/'frames.csv').open(encoding='utf-8-sig', newline='') as f:
+        frames = list(csv.DictReader(f))
+    with np.load(destination/'recording.npz') as recording:
+        meta = recording['metadata']
+        assert list(recording['metadata_columns']) == metadata_columns(m)
+        assert len(meta) == len(recording['eeg']) == len(recording['states'])
+    frozen = joblib.load(destination/'frozen_model.joblib')
+    assert set(frozen['models']) == set(METHODS)
+    assert summary['completed'] and summary['model_frozen'] and not summary['error']
+    assert len(summary['tests']) == 3 and set(summary['test_method_order']) == set(METHODS)
+    assert len({t['cue_seed'] for t in summary['tests']}) == 3
+    assert np.all(np.asarray(training['counts']) >= cfg.min_samples)
+    assert set(training['methods']) == set(METHODS)
+    assert len(frames) == json.loads((destination/'timing_diagnostics_summary.json').read_text())['frame_rows']
+    assert [int(f['frame']) for f in frames] == list(range(len(frames)))
+    for edge, label, segment, edge_sample, start, stop in training['windows']:
+        rows = meta[start:stop]
+        assert stop-start == 200 and edge_sample-start == 100
+        assert np.all(rows[:, LABEL] == label+1)
+        assert np.all(rows[:, SEGMENT] == segment)
+        assert np.all(rows[:, STAGE] == TRAIN)
+        assert np.all(rows[:, TRAIN_VALID] == 1)
+        assert np.all(rows[:, VALID] == 1)
+    for test in summary['tests']:
+        i = test['test_id']
+        assert test['completed']
+        assert test['stop_reason'] == ('time_limit' if stop_mode == 'time' else 'completed_cue_count')
+        assert test['ready_time'] < test['space_accepted_at'] < test['stimulus_start'] < test['online_start'] < test['online_end']
+        assert test['warmup_actual_seconds'] >= cfg.test_warmup_seconds
+        assert test['method'] == summary['test_method_order'][i-1]
+        test_frames = [f for f in frames if f['test_id'] == str(i)]
+        stimulus_ids = {int(f['stimulus_id']) for f in test_frames}
+        assert len(stimulus_ids) == 1 and min(stimulus_ids) > 0
+        assert [int(f['stimulus_frame']) for f in test_frames] == list(range(len(test_frames)))
+        assert all(f['method'] == test['method'] for f in test_frames)
+        cues = [(e['time'], e['cue']) for e in events if e['test_id'] == i and e['stage'] == 'online']
+        published = [(p['publication_time'], p['prediction']) for p in predictions
+                     if p['test_id'] == i and p['publication_time'] is not None]
+        assert published and len(published) == test['prediction_count']
+        assert all(test['online_start'] <= t <= test['online_end'] for t, _ in published)
+        assert all(p['method'] == test['method'] for p in predictions if p['test_id'] == i)
+        assert all(np.all(meta[p['start']:p['stop'], INTENSITY+m+2] == i)
+                   for p in predictions if p['test_id'] == i and p['publication_time'] is not None)
+        result = time_accuracy(cues, published, test['online_start'], test['online_end'], mode == 'cued')
+        assert result == {key: test[key] for key in result}
+        if mode == 'cued':
+            labels = [label for _, label in cues]
+            assert all(a != b for a, b in zip(labels, labels[1:]))
+            assert 0 <= test['time_accuracy'] <= 1
+            if stop_mode == 'segments':
+                assert test['cue_count_completed'] == test['cue_count_presented'] == cfg.online_cue_count
+            else:
+                assert cfg.online_seconds <= test['duration_seconds'] < cfg.online_seconds+.1
+        else:
+            assert test['time_accuracy'] is None and test['correct_seconds'] is None
+    black = np.isin(meta[:, STAGE], (0, 2, 3, 4, 6, 7))
+    assert np.all(meta[black, INTENSITY:INTENSITY+m] == 0)
+    assert np.all(meta[black, INTENSITY+m] == 0)
+    print(f"PASS M{m} {mode} {stop_mode}: {summary['prediction_count']} predictions", flush=True)
+    return dict(m=m, mode=mode, stop_mode=stop_mode, passed=True,
+                method_order=summary['test_method_order'])
 
 
 def main():
     root = Path(__file__).resolve().parent
-    output = root/"online_results"/"software_checks"/(datetime.now().strftime("%Y%m%d_%H%M%S")+"_"+uuid4().hex[:6])
+    output = root/'online_results'/'software_checks'/(datetime.now().strftime('%Y%m%d_%H%M%S')+'_'+uuid4().hex[:6])
     output.mkdir(parents=True)
-    cfg = Config(training_blocks=1, train_cue_seconds=(1., 1.), skip_seconds=.2,
-                 min_samples=5, online_seconds=2., online_cue_seconds=(.35, .55))
-    config_path = output/"smoke_config.json"
-    write_json(config_path, cfg.to_dict())
-    reports = []
-    cases = [(m, method, "cued") for m in (2, 4) for method in METHODS]
-    cases.append((4, "Aug_FB_eTRCA", "uncued"))
-    for m, method, mode in cases:
-        destination = output/f"M{m}_{method}_{mode}"
-        command = [sys.executable, str(root/"online_experiment.py"), "--config", str(config_path),
-                   "--simulate", "--headless", "--task-m", str(m), "--method", method,
-                   "--online-mode", mode, "--output", str(destination)]
-        run = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=90)
-        (output/f"{destination.name}.log").write_text(run.stdout+run.stderr, encoding="utf-8")
-        if run.returncode:
-            raise RuntimeError(f"{destination.name} failed: {run.stdout}\n{run.stderr}")
-        summary = json.loads((destination/"summary.json").read_text(encoding="utf-8"))
-        training = json.loads((destination/"training.json").read_text(encoding="utf-8"))
-        predictions = json.loads((destination/"predictions.json").read_text(encoding="utf-8"))
-        events = json.loads((destination/"events.json").read_text(encoding="utf-8"))
-        assert summary["completed"] and summary["model_frozen"] and not summary["error"]
-        assert summary["prediction_count"] > 0
-        assert 2 <= summary["duration_seconds"] < 2.2
-        assert np.all(np.asarray(training["counts"]) >= cfg.min_samples)
-        assert (destination/"frozen_model.joblib").is_file()
-        stages = list(dict.fromkeys(event["stage"] for event in events))
-        assert stages == ["training", "draining", "fitting", "catchup", "waiting_test", "test_warmup", "online"], stages
-        assert summary["test_ready_time"] < summary["test_space_accepted_at"] < summary["test_stimulus_start"] < summary["online_start"]
-        assert summary["test_warmup_actual_seconds"] >= cfg.test_warmup_seconds
-        assert summary["test_start_input"] == "automatic_synthetic_test"
-        published = [p for p in predictions if p["publication_time"] is not None]
-        assert all(summary["online_start"] <= p["publication_time"] <= summary["online_end"] for p in published)
-        assert {p["edge"] for p in published} == set(range(1, m+1))
-        with np.load(destination/"recording.npz") as recording:
-            meta, eeg, states = recording["metadata"], recording["eeg"], recording["states"]
-            assert len(eeg) == len(meta) == len(states)
-            assert list(recording["metadata_columns"]) == metadata_columns(m)
-            black = np.isin(meta[:, STAGE], (0, 2, 3, 4, 6, 7))
-            assert np.all(meta[black, INTENSITY:INTENSITY+m] == 0)
-            assert np.all(meta[black, INTENSITY+m] == 0)
-            assert np.all(meta[black, INTENSITY+m+1] == -1)
-            for edge, label, segment, edge_sample, start, stop in training["windows"]:
-                epoch_meta = meta[start:stop]
-                assert stop-start == 200 and edge_sample-start == 100
-                assert np.all(epoch_meta[:, LABEL] == label+1)
-                assert np.all(epoch_meta[:, SEGMENT] == segment)
-                assert np.all(epoch_meta[:, STAGE] == TRAIN)
-                assert np.all(epoch_meta[:, TRAIN_VALID] == 1)
-                assert np.all(epoch_meta[:, VALID] == 1)
-            for prediction in published:
-                a, b = prediction["start"], prediction["stop"]
-                window_meta = meta[a:b]
-                assert np.all(np.isin(window_meta[:, STAGE], (WARMUP, ONLINE)))
-                assert np.all(window_meta[:, INTENSITY+m] == 2)
-        with (destination/"frames.csv").open(encoding="utf-8-sig", newline="") as handle:
-            frames = list(csv.DictReader(handle))
-        assert [int(f["frame"]) for f in frames] == list(range(len(frames)))
-        for stimulus_id in (1, 2):
-            stimulus_frames = [f for f in frames if int(f["stimulus_id"]) == stimulus_id]
-            assert [int(f["stimulus_frame"]) for f in stimulus_frames] == list(range(len(stimulus_frames)))
-            assert json.loads(stimulus_frames[0]["intensity"]) == [float(2*i < m) for i in range(m)]
-        warmup_event = next(e for e in events if e['stage'] == 'test_warmup')
-        first_online_event = next(e for e in events if e['stage'] == 'online')
-        assert warmup_event['cue'] == first_online_event['cue']
-        assert warmup_event['segment'] == first_online_event['segment']
-        cues = [e["cue"] for e in events if e["stage"] == "online"]
-        if mode == "cued":
-            assert len(cues) >= 3 and all(a != b for a, b in zip(cues, cues[1:]))
-            assert 0 <= summary["time_accuracy"] <= 1
-        else:
-            assert cues == [0] and summary["time_accuracy"] is None and summary["correct_seconds"] is None
-        reports.append(dict(case=destination.name, passed=True, duration=summary["duration_seconds"],
-                            predictions=summary["prediction_count"], counts=training["counts"],
-                            fit_seconds=training["fit_seconds"]))
-        print(f"PASS {destination.name}: {summary['prediction_count']} predictions", flush=True)
-    write_json(output/"verification.json", reports)
+    cases = [(2, 'cued', 'time'), (4, 'cued', 'time'),
+             (2, 'cued', 'segments'), (4, 'cued', 'segments'),
+             (4, 'uncued', 'time')]
+    reports = [check_case(root, output/f'case_{i}', *case)
+               for i, case in enumerate(cases, 1)]
+    write_json(output/'verification.json', reports)
     print(f"All {len(reports)} process-level cases passed: {output}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -68,3 +68,6 @@ uv run --locked python benchmark_timing_diagnostics.py --frames 100000
 本次验证：18项单元测试通过；新建600 Hz计划节奏的合成流程在开启/关闭两种配置下均完成训练、冻结、等待、缓冲与online，各发布78条预测；开启时4287个已呈现帧与定位记录逐行匹配，长间隔分段之和一致。没有运行真实放大器或物理600 Hz显示器。
 
 目前只增加定位信息，尚未根据长帧自动排除训练窗口。可先积累异常及其归因证据，再单独确定质量阈值和保护规则。
+# 三段测试的归属
+
+新版 `frames.csv` 与 `events.json` 含 `test_id`、`method`；`predictions.json` 还记录触发窗口所属的测试编号和算法。`timing_diagnostics_summary.json` 的长帧间隔同时含当前帧和前一帧的 `test_id`/`method`，并给出 `long_interval_count_by_test`。段间切黑帧可能属于 `test_id=0`，所以定位跨边界停顿时应查看 `previous_test_id`。记录仍按全局帧号关联，不会因每段刺激局部帧号重置而冲突。

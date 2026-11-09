@@ -12,7 +12,7 @@ from scipy.signal import butter, iirnotch, sosfilt, tf2sos
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from threadpoolctl import threadpool_limits
 from online_core import *
-from online_experiment import OnlineState, publish_rows, read_rows, Schedule, draw_frame
+from online_experiment import OnlineState, publish_rows, read_rows, Schedule, draw_frame, training_ready
 
 
 class OnlineTests(unittest.TestCase):
@@ -48,6 +48,7 @@ class OnlineTests(unittest.TestCase):
         meta[:, VALID] = 1
         meta[:, INTENSITY+m] = 1
         meta[:, INTENSITY+m+1] = np.arange(length)//16
+        meta[:, INTENSITY+m+2] = 1
         for r in range(m):
             meta[:, INTENSITY+r] = ((np.arange(length)+r*200//m) % 200 >= 100)
         return raw, meta
@@ -125,6 +126,68 @@ class OnlineTests(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         bank.collect(Epoch(0, 100, 0, 200, x, 0, 0, True, False))
 
+    def test_shared_training_fits_three_distinct_frozen_models(self):
+        rng = np.random.default_rng(23)
+        cfg = replace(Config(), task_m=2, min_samples=3, eeg_channels=(0, 1),
+                      bands=((5., 95.), (12., 95.)))
+        bank = EdgeModelBank(cfg)
+        templates = rng.normal(size=(2, 2, 2, 2, 100))
+        for edge in range(2):
+            for label in range(2):
+                for _ in range(5):
+                    bank.collect(Epoch(edge, 100, 0, 200,
+                                       templates[edge, label]+rng.normal(0, .01, (2, 2, 100)),
+                                       label, label, True, False))
+        with threadpool_limits(limits=1):
+            models = fit_all_methods(bank)
+            self.assertEqual(set(models), set(METHODS))
+            for method, model in models.items():
+                self.assertTrue(model.frozen)
+                np.testing.assert_array_equal(model.counts, bank.counts)
+                for edge in range(2):
+                    for label in range(2):
+                        self.assertEqual(model.predict(edge, templates[edge, label])[0], label, method)
+        self.assertIsNone(bank.samples)
+
+    def test_three_tests_stop_modes_and_independent_cues(self):
+        for mode in ("segments", "time"):
+            cfg = replace(Config(), online_stop_mode=mode, online_seconds=.2,
+                          online_cue_count=2, online_cue_seconds=(.1, .1),
+                          catchup_hold_seconds=.01, test_warmup_seconds=0.)
+            schedule = Schedule(cfg)
+            self.assertEqual(set(schedule.method_order), set(METHODS))
+            self.assertEqual(len(set(schedule.test_seeds)), 3)
+            share = OnlineState(replace(cfg, ring_seconds=.005))
+            share.frozen.value = True
+            share.last_batch.value = 100.
+            for index in range(3):
+                schedule.stage = WAIT_TEST
+                schedule.test_ready_time = 100.
+                schedule.advance(100., share, start_test=True)
+                self.assertEqual(schedule.stage, WARMUP)
+                self.assertEqual(schedule.current_test_id(), index+1)
+                self.assertEqual(schedule.current_method(), schedule.method_order[index])
+                schedule.test_stimulus_start = 100.
+                schedule.advance(100., share)
+                self.assertEqual(schedule.stage, ONLINE)
+                schedule.online_start = 100.
+                schedule.cue_start = 100.
+                if mode == "segments":
+                    first_label = schedule.online_cue[0]
+                    schedule.advance(100.11, share)
+                    self.assertEqual(schedule.stage, ONLINE)
+                    self.assertEqual(schedule.online_cue_count, 2)
+                    self.assertNotEqual(schedule.online_cue[0], first_label)
+                    schedule.cue_start = 100.11
+                    schedule.advance(100.22, share)
+                    self.assertEqual(schedule.test_records[index]["cue_count_completed"], 2)
+                else:
+                    schedule.advance(100.21, share)
+                self.assertEqual(schedule.stage, END if index == 2 else CATCHUP)
+                self.assertEqual(schedule.test_index, index+1)
+                self.assertEqual(schedule.test_records[index]["stop_reason"],
+                                 "time_limit" if mode == "time" else "completed_cue_count")
+
     def test_lda_stacking_matches_independent_reference(self):
         rng = np.random.default_rng(7)
         for m in (2, 4):
@@ -169,6 +232,19 @@ class OnlineTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             publish_rows(share, rows)
 
+    def test_training_prompt_requires_warmup_published_fresh_batch(self):
+        cfg = Config()
+        share = OnlineState(cfg)
+        now = 100.
+        self.assertFalse(training_ready(share, cfg, now))
+        share.recorder_ready.value = True
+        self.assertFalse(training_ready(share, cfg, now))
+        share.buff_idx.value = 10
+        share.last_batch.value = now-.1
+        self.assertTrue(training_ready(share, cfg, now))
+        share.last_batch.value = now-cfg.no_data_timeout_seconds-1
+        self.assertFalse(training_ready(share, cfg, now))
+
     def test_schedule_wall_clock_blocks_and_adjacent_cues(self):
         cfg = Config()
         schedule = Schedule(cfg)
@@ -196,6 +272,8 @@ class OnlineTests(unittest.TestCase):
             replace(Config(), reference_channels=()).validate()
         with self.assertRaises(ValueError):
             replace(Config(), fs=1000).validate()
+        with self.assertRaises(ValueError):
+            replace(Config(), online_mode="uncued", online_stop_mode="segments").validate()
 
     def test_fit_and_catchup_gate_and_extra_block_limit(self):
         cfg = replace(Config(), task_m=2, training_blocks=1, max_extra_blocks=1)

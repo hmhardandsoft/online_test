@@ -15,13 +15,13 @@ uv run --locked python .\verify_online_runs.py
 先将目标显示器设为 Windows 主显示器，并在系统中选择相应刷新率。
 
 ```powershell
-# 600 Hz，M4，TRCA
-uv run --locked python .\online_experiment.py --config .\online_config_600hz.json --method Aug_FB_TRCA --task-m 4
-# 120 Hz，M4，TRCA
-uv run --locked python .\online_experiment.py --config .\online_config.json --method Aug_FB_TRCA --task-m 4
+# 600 Hz，M4；一次训练，三种算法随机顺序各测一段
+uv run --locked python .\online_experiment.py --config .\online_config_600hz.json --task-m 4
+# 120 Hz，M4；每段测试完成 30 个完整提示
+uv run --locked python .\online_experiment.py --config .\online_config.json --task-m 4 --online-stop-mode segments --online-cue-count 30
 ```
 
-第一次 SPACE 开始训练；训练结束黑屏拟合、冻结、追赶，然后显示 PRESS SPACE TO START。第二次 SPACE 从初始相位启动测试，缓冲结束后连续进入计分。ESC 退出并保存。
+放大器预热且有新鲜数据后显示第一次 `PRESS SPACE TO START`；按 SPACE 开始训练。训练结束黑屏拟合并冻结三种模型，解码追上实时数据后显示第一段测试的提示。三段测试各自等待新的 SPACE，从初始相位启动刺激，缓冲结束后计分。段间黑屏。ESC 退出并保存。
 
 600 Hz 配置仅改变刷新率，FS=2000、窗口200样本、刺激10 Hz和训练时长保持一致。实际600 Hz帧间隔及硬件采集仍需在目标电脑上验证。
 

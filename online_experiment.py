@@ -14,6 +14,7 @@ import json
 import multiprocessing as mp
 from pathlib import Path
 import random
+import secrets
 import time
 import traceback
 from uuid import uuid4
@@ -26,7 +27,7 @@ from timing_diagnostics import TimingDiagnostics
 from online_core import (Config, METHODS, WAIT, TRAIN, DRAIN, FIT, CATCHUP, ONLINE, END,
                          WAIT_TEST, WARMUP, FLICKER_STAGES, metadata_columns,
                          STAGES, LABEL, TRAIN_VALID, STAGE, SEGMENT, VALID, INTENSITY,
-                         EpochStream, EdgeModelBank, time_accuracy)
+                         EpochStream, EdgeModelBank, fit_all_methods, time_accuracy)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -73,6 +74,14 @@ class OnlineState(SharedState):
         self.failed = mp.Value("b", False)
         self.last_batch = mp.Value("d", 0.)
         self.prediction_time = mp.Value("d", 0.)
+        self.test_id = mp.Value("i", 0)
+        self.method_index = mp.Value("i", -1)
+
+
+def training_ready(share, cfg, now):
+    """Only show the first prompt after amplifier warmup and a fresh published batch."""
+    return bool(share.recorder_ready.value and share.buff_idx.value > 0
+                and now-share.last_batch.value <= cfg.no_data_timeout_seconds)
 
 
 def ring_view(share):
@@ -168,7 +177,7 @@ def acquisition_worker(share, cfg, output, simulate, device_name):
                 meta = np.array([share.true_label.value, share.is_training.value,
                                  share.stage.value, share.segment.value, int(drops == 0),
                                  *share.intensities[:cfg.task_m], share.stimulus_id.value,
-                                 share.stimulus_frame.value], dtype=float)
+                                 share.stimulus_frame.value, share.test_id.value], dtype=float)
             snapshot_after = time.perf_counter()
             rows = np.column_stack((raw, np.tile(np.r_[state, meta], (len(raw), 1))))
             # Save the anomalous batch as evidence, but never train/predict across it.
@@ -216,20 +225,21 @@ def acquisition_worker(share, cfg, output, simulate, device_name):
             fail(share, output, "recorder_save", exc)
 
 
-def decoder_worker(share, cfg, output):
+def decoder_worker(share, cfg, output, method_order):
     stream, bank = EpochStream(cfg), EdgeModelBank(cfg)
+    models = None
     predictions, diagnostics = [], []
     fit_seconds = None
     try:
         with threadpool_limits(limits=1):
             while share.is_running.value:
-                if share.fit_requested.value and not bank.frozen:
+                if share.fit_requested.value and models is None:
                     started = time.perf_counter()
-                    bank.fit()
-                    joblib.dump(dict(config=cfg.to_dict(), model=bank), Path(output)/"frozen_model.joblib")
+                    models = fit_all_methods(bank)
+                    joblib.dump(dict(config=cfg.to_dict(), models=models), Path(output)/"frozen_model.joblib")
                     fit_seconds = time.perf_counter()-started
                     share.frozen.value = True
-                    print(f"[Decoder] {cfg.method} frozen in {fit_seconds:.3f}s; counts={bank.counts.tolist()}", flush=True)
+                    print(f"[Decoder] All methods frozen in {fit_seconds:.3f}s; counts={bank.counts.tolist()}", flush=True)
                 start, rows = read_rows(share)
                 if len(rows):
                     processed_at = time.perf_counter()
@@ -237,25 +247,35 @@ def decoder_worker(share, cfg, output):
                     for epoch in epochs:
                         if epoch.training and not bank.frozen:
                             bank.collect(epoch)
-                        elif epoch.online and bank.frozen:
+                        elif epoch.online and models is not None:
                             lag = (share.buff_idx.value-epoch.stop)/cfg.fs
-                            if lag > cfg.max_prediction_lag_seconds or share.stage.value != ONLINE:
+                            test_id = epoch.test_id
+                            method = method_order[test_id-1] if 1 <= test_id <= len(method_order) else None
+                            current = (share.stage.value == ONLINE and share.test_id.value == test_id
+                                       and share.stimulus_id.value == epoch.stimulus_id and method is not None
+                                       and share.method_index.value == METHODS.index(method))
+                            if lag > cfg.max_prediction_lag_seconds or not current:
                                 predictions.append(dict(edge=epoch.edge+1, edge_sample=epoch.edge_sample,
                                     start=epoch.start, stop=epoch.stop, publication_time=None, prediction=0,
-                                    scores=None, lag_seconds=lag, status="skipped_stale_or_ended"))
+                                    scores=None, lag_seconds=lag, test_id=test_id, method=method,
+                                    stimulus_id=epoch.stimulus_id, status="skipped_stale_or_ended"))
                                 continue
-                            label, scores = bank.predict(epoch.edge, epoch.x)
+                            label, scores = models[method].predict(epoch.edge, epoch.x)
                             # Recheck AFTER computation as well; never publish a stale result knowingly.
                             lag = (share.buff_idx.value-epoch.stop)/cfg.fs
                             published = None
                             with share.prediction_lock:
-                                if lag <= cfg.max_prediction_lag_seconds and share.stage.value == ONLINE:
+                                if (lag <= cfg.max_prediction_lag_seconds and share.stage.value == ONLINE
+                                        and share.test_id.value == test_id
+                                        and share.stimulus_id.value == epoch.stimulus_id
+                                        and share.method_index.value == METHODS.index(method)):
                                     published = time.perf_counter()
                                     share.predict_label.value = label+1
                                     share.prediction_time.value = published
                             predictions.append(dict(edge=epoch.edge+1, edge_sample=epoch.edge_sample,
                                 start=epoch.start, stop=epoch.stop, publication_time=published,
                                 prediction=label+1, scores=scores.tolist(), lag_seconds=lag,
+                                test_id=test_id, method=method, stimulus_id=epoch.stimulus_id,
                                 status="published" if published is not None else "skipped_stale_or_ended"))
                     share.read_idx.value = start+len(rows)
                     share.train_ready.value = bank.ready()
@@ -276,7 +296,8 @@ def decoder_worker(share, cfg, output):
             write_json(Path(output)/"predictions.json", predictions)
             write_csv(Path(output)/"decoder_batches.csv", diagnostics)
             write_json(Path(output)/"training.json", dict(counts=bank.counts.tolist(),
-                       frozen=bank.frozen, fit_seconds=fit_seconds,
+                       frozen=bool(share.frozen.value), methods=list(models) if share.frozen.value else [],
+                       fit_seconds=fit_seconds,
                        index_columns=["edge_zero_based", "class_zero_based", "segment", "edge_sample", "start", "stop"],
                        windows=bank.training_index))
         except BaseException as exc:
@@ -287,6 +308,22 @@ class Schedule:
     """Wall-clock cue timing. A cue starts at its first software swap timestamp."""
     def __init__(self, cfg):
         self.cfg, self.rng = cfg, random.Random(cfg.seed)
+        self.test_seed = secrets.randbits(64)
+        order_rng = random.Random(self.test_seed)
+        self.method_order = list(METHODS)
+        order_rng.shuffle(self.method_order)
+        self.test_seeds = [order_rng.getrandbits(64) for _ in METHODS]
+        self.test_rngs = [random.Random(seed) for seed in self.test_seeds]
+        self.test_records = [dict(test_id=i+1, method=method, cue_seed=self.test_seeds[i],
+                                  stop_mode=cfg.online_stop_mode, requested_seconds=cfg.online_seconds,
+                                  requested_cue_count=cfg.online_cue_count, cue_count_presented=0,
+                                  cue_count_completed=0, ready_time=None, space_accepted_at=None,
+                                  stimulus_start=None, online_start=None, online_end=None,
+                                  stop_reason=None)
+                             for i, method in enumerate(self.method_order)]
+        self.test_index = 0
+        self.pending_finish = None
+        self.online_cue_count = 0
         self.cues = []
         self.blocks = 0
         for _ in range(cfg.training_blocks):
@@ -315,11 +352,20 @@ class Schedule:
         self.blocks += 1
 
     def next_online(self):
+        rng = self.test_rngs[self.test_index]
         previous = self.online_cue[0] if self.online_cue else 0
-        label = self.rng.choice([i for i in range(1, self.cfg.task_m+1) if i != previous])
-        self.online_cue = (label, self.rng.uniform(*self.cfg.online_cue_seconds))
+        label = rng.choice([i for i in range(1, self.cfg.task_m+1) if i != previous])
+        self.online_cue = (label, rng.uniform(*self.cfg.online_cue_seconds))
+        self.online_cue_count += 1
+        self.test_records[self.test_index]["cue_count_presented"] = self.online_cue_count
         self.segment += 1
         self.cue_start = None
+
+    def current_test_id(self):
+        return self.test_index+1 if self.stage in (WARMUP, ONLINE) else 0
+
+    def current_method(self):
+        return self.method_order[self.test_index] if self.stage in (WARMUP, ONLINE) else None
 
     def cue(self):
         if self.stage == TRAIN:
@@ -379,7 +425,7 @@ class Schedule:
                     self.stage = WAIT_TEST
             else:
                 self.caught_since = None
-            if self.stage_start is not None and now-self.stage_start > 15:
+            if self.stage_start is not None and now-self.stage_start > 60:
                 raise RuntimeError("Frozen decoder could not catch up with acquisition")
         elif self.stage == WAIT_TEST:
             if not self.decoder_ready(now, share):
@@ -387,9 +433,16 @@ class Schedule:
                 # is discarded, and the subject must press again after readiness.
                 self.stage = CATCHUP
                 self.caught_since = None
+                self.test_ready_time = None
             elif start_test and self.test_ready_time is not None:
                 self.test_space_accepted_at = now
+                self.test_records[self.test_index]["space_accepted_at"] = now
                 self.stage = WARMUP
+                self.online_cue = None
+                self.online_cue_count = 0
+                self.online_start = None
+                self.cue_start = None
+                self.test_stimulus_start = None
                 if self.cfg.online_mode == "cued":
                     self.next_online()
                 with share.prediction_lock:
@@ -403,11 +456,24 @@ class Schedule:
                 # The first cue remains visible; its scored duration starts now.
                 self.cue_start = None
         elif self.stage == ONLINE and self.online_start is not None:
-            if now-self.online_start >= self.cfg.online_seconds:
-                self.stage = END
-            elif self.cfg.online_mode == "cued" and self.cue_start is not None:
-                if now-self.cue_start >= self.cue()[1]:
-                    self.next_online()
+            reached_time = (self.cfg.online_stop_mode == "time"
+                            and now-self.online_start >= self.cfg.online_seconds)
+            cue_done = (self.cfg.online_mode == "cued" and self.cue_start is not None
+                        and now-self.cue_start >= self.cue()[1])
+            reached_count = (self.cfg.online_stop_mode == "segments" and cue_done
+                             and self.online_cue_count >= self.cfg.online_cue_count)
+            if reached_time or reached_count:
+                if cue_done:
+                    self.test_records[self.test_index]["cue_count_completed"] += 1
+                self.test_records[self.test_index]["stop_reason"] = (
+                    "time_limit" if reached_time else "completed_cue_count")
+                self.pending_finish = self.test_index
+                self.test_index += 1
+                self.stage = END if self.test_index == len(self.method_order) else CATCHUP
+                self.caught_since = None
+            elif cue_done:
+                self.test_records[self.test_index]["cue_count_completed"] += 1
+                self.next_online()
 
 
 def present_state(share, cfg, schedule, frame, intensities, timestamp):
@@ -418,6 +484,9 @@ def present_state(share, cfg, schedule, frame, intensities, timestamp):
         share.segment.value = schedule.segment
         share.stimulus_id.value = schedule.stimulus_id
         share.stimulus_frame.value = schedule.stimulus_frame
+        share.test_id.value = schedule.current_test_id()
+        share.method_index.value = (METHODS.index(schedule.current_method())
+                                    if schedule.current_method() else -1)
         share.frame_idx.value = frame
         share.true_label.value = label
         share.target_phase.value = 2*np.pi*(label-1)/cfg.task_m if label else 0.
@@ -442,6 +511,7 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
     completed, error = False, None
     schedule = Schedule(cfg)
     online_end = None
+    train_ready_time = train_prompt_time = train_space_accepted_at = None
     timing = TimingDiagnostics(cfg.timing_diagnostics)
     try:
         if not headless:
@@ -453,26 +523,43 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
         timing.attach(glfw, stim.window if stim else None)
         workers = [mp.Process(target=acquisition_worker, name="online-recorder",
                               args=(share, cfg, str(output), simulate, device_name)),
-                   mp.Process(target=decoder_worker, name="online-decoder", args=(share, cfg, str(output)))]
+                   mp.Process(target=decoder_worker, name="online-decoder",
+                              args=(share, cfg, str(output), schedule.method_order))]
         for worker in workers:
             worker.start()
         deadline = time.perf_counter()+30
-        while not share.recorder_ready.value or (not headless and not stim._space_pressed):
+        return_code = None
+        train_prompt_visible = False
+        train_ready_time = train_prompt_time = train_space_accepted_at = None
+        while True:
+            now = time.perf_counter()
+            ready = training_ready(share, cfg, now)
+            if ready and train_ready_time is None:
+                train_ready_time = now
+            if ready and (headless or (train_prompt_visible and stim._space_pressed)):
+                train_space_accepted_at = now
+                break
             if share.failed.value or any(not p.is_alive() for p in workers):
                 raise RuntimeError("Worker failed during startup; see worker error JSON")
-            if not share.recorder_ready.value and time.perf_counter() > deadline:
+            if not ready and now > deadline:
                 raise RuntimeError("Amplifier startup timed out")
             if stim:
                 if glfw.window_should_close(stim.window):
                     return_code = 0
                     break
                 graphics.glClear(graphics.GL_COLOR_BUFFER_BIT)
-                stim._draw_centered_text_5x7("PRESS SPACE TO START", pixel_size=3.)
+                if ready:
+                    if not train_prompt_visible:
+                        stim._space_pressed = False  # Discard any key pressed during connection/warmup.
+                    stim._draw_centered_text_5x7("PRESS SPACE TO START", pixel_size=3.)
+                else:
+                    stim._space_pressed = False
                 glfw.swap_buffers(stim.window)
+                if ready and not train_prompt_visible:
+                    train_prompt_time = time.perf_counter()
                 glfw.poll_events()
+                train_prompt_visible = bool(ready)
             time.sleep(.01)
-        else:
-            return_code = None
         if return_code is not None:
             return return_code
         share.start_requested.value = True
@@ -499,9 +586,6 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
                 # Software tests have no keyboard; explicitly emulate a NEW key.
                 start_test = now-schedule.test_ready_time >= .25
             schedule.advance(now, share, start_test=start_test)
-            if schedule.stage == END:
-                completed = True
-                break
             lag = (share.buff_idx.value-share.read_idx.value)/cfg.fs
             if schedule.stage in (WARMUP, ONLINE) and lag > cfg.max_prediction_lag_seconds:
                 overload_since = now if overload_since is None else overload_since
@@ -548,11 +632,17 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
                 schedule.cue_start = swapped
             if schedule.stage == ONLINE and schedule.online_start is None:
                 schedule.online_start = swapped
+                schedule.test_records[schedule.test_index]["online_start"] = swapped
             if schedule.stage == WARMUP and schedule.test_stimulus_start is None:
                 schedule.test_stimulus_start = swapped
+                schedule.test_records[schedule.test_index]["stimulus_start"] = swapped
             if schedule.stage == WAIT_TEST and last_stage != WAIT_TEST:
                 schedule.test_ready_time = swapped
-                print("[Online] Frozen and realtime. Press SPACE again to start the test.", flush=True)
+                schedule.test_records[schedule.test_index]["ready_time"] = swapped
+                print(f"[Online] Test {schedule.test_index+1}/3: {schedule.method_order[schedule.test_index]} ready. Press SPACE.", flush=True)
+            if schedule.pending_finish is not None:
+                schedule.test_records[schedule.pending_finish]["online_end"] = swapped
+                schedule.pending_finish = None
             if schedule.stage != last_stage:
                 schedule.stage_start = swapped
                 print(f"[Stage] {STAGES[schedule.stage]}", flush=True)
@@ -566,17 +656,22 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
             if schedule.stage != last_stage or schedule.segment != previous_segment:
                 events.append(dict(time=swapped, stage=STAGES[schedule.stage], segment=schedule.segment,
                                    cue=label, duration_requested=duration, sample_write=share.buff_idx.value,
-                                   stimulus_id=schedule.stimulus_id, stimulus_frame=schedule.stimulus_frame))
+                                   stimulus_id=schedule.stimulus_id, stimulus_frame=schedule.stimulus_frame,
+                                   test_id=schedule.current_test_id(), method=schedule.current_method()))
             timing.mark('events_end')
             frames.append(dict(frame=frame, swap_before=swap_before, swap_after=swapped,
                 interval=None if previous_swap is None else swapped-previous_swap,
                 stage=STAGES[schedule.stage], segment=schedule.segment, cue=label,
+                test_id=schedule.current_test_id(), method=schedule.current_method(),
                 stimulus_id=schedule.stimulus_id, stimulus_frame=schedule.stimulus_frame,
                 displayed_prediction=pred if cfg.feedback else 0,
                 intensity=json.dumps(intensities), decoder_backlog_samples=share.buff_idx.value-share.read_idx.value))
             timing.finish()
             previous_swap, last_stage, previous_segment = swapped, schedule.stage, schedule.segment
             frame += 1
+            if schedule.stage == END:
+                completed = True
+                break
         if share.failed.value:
             raise RuntimeError("Worker failed; inspect error JSON")
     except (Exception, KeyboardInterrupt) as exc:
@@ -591,12 +686,18 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
             except Exception:
                 pass
         online_end = time.perf_counter()
+        if (schedule.test_index < len(schedule.test_records)
+                and schedule.test_records[schedule.test_index]["online_start"] is not None
+                and schedule.test_records[schedule.test_index]["online_end"] is None):
+            schedule.test_records[schedule.test_index]["online_end"] = online_end
         with share.snapshot_lock:
             share.stage.value = END
             share.start_predict.value = False
             share.is_training.value = False
             share.stimulus_id.value = 0
             share.stimulus_frame.value = -1
+            share.test_id.value = 0
+            share.method_index.value = -1
             share.intensities[:] = [0.]*SharedState.MAX_TARGETS
             share.stimulus_intensity.value = 0.
         share.is_running.value = False
@@ -617,10 +718,22 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
             glfw.terminate()
         prediction_file = Path(output)/"predictions.json"
         predictions = json.loads(prediction_file.read_text(encoding="utf-8")) if prediction_file.exists() else []
-        published = [(p["publication_time"], p["prediction"]) for p in predictions if p["publication_time"] is not None]
-        cues = [(e["time"], e["cue"]) for e in events if e["stage"] == "online"]
-        accuracy = time_accuracy(cues, published, schedule.online_start or online_end, online_end,
-                                 cfg.online_mode == "cued")
+        tests = []
+        for record in schedule.test_records:
+            item = dict(record)
+            start, stop = item["online_start"], item["online_end"]
+            published = [(p["publication_time"], p["prediction"]) for p in predictions
+                         if p["publication_time"] is not None and p["test_id"] == item["test_id"]]
+            cues = [(e["time"], e["cue"]) for e in events
+                    if e["stage"] == "online" and e["test_id"] == item["test_id"]]
+            item["prediction_count"] = len(published)
+            item["test_start_input"] = "automatic_synthetic_test" if headless else "space_key"
+            item["warmup_actual_seconds"] = (start-item["stimulus_start"]
+                if start is not None and item["stimulus_start"] is not None else None)
+            item["completed"] = stop is not None and item["stop_reason"] is not None
+            item.update(time_accuracy(cues, published, start or online_end, stop or online_end,
+                                      cfg.online_mode == "cued"))
+            tests.append(item)
         intervals = [f["interval"] for f in frames if f["interval"] is not None]
         training_segments_presented = sum(e["stage"] == "training" for e in events)
         summary = dict(completed=completed and error is None, error=error, simulated=simulate,
@@ -628,23 +741,21 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
                        model_frozen=bool(share.frozen.value), training_blocks_scheduled=schedule.blocks,
                        training_blocks_used=(training_segments_presented+cfg.task_m-1)//cfg.task_m,
                        training_segments_presented=training_segments_presented,
-                       test_ready_time=schedule.test_ready_time,
-                       test_space_accepted_at=schedule.test_space_accepted_at,
-                       test_start_input="automatic_synthetic_test" if headless else "space_key",
-                       test_stimulus_start=schedule.test_stimulus_start,
-                       test_warmup_actual_seconds=(schedule.online_start-schedule.test_stimulus_start
-                           if schedule.online_start is not None and schedule.test_stimulus_start is not None else None),
+                       train_ready_time=train_ready_time, train_prompt_time=train_prompt_time,
+                       train_space_accepted_at=train_space_accepted_at,
+                       test_seed=schedule.test_seed, test_method_order=schedule.method_order,
+                       tests=tests, online_stop_mode=cfg.online_stop_mode,
                        metadata_columns=metadata_columns(cfg.task_m), stage_codes=dict(enumerate(STAGES)),
-                       online_start=schedule.online_start, online_end=online_end, **accuracy,
                        accuracy_basis="held decoder output at host publication time; cue at software swap return",
-                       prediction_count=len(published), config=cfg.to_dict(),
+                       prediction_count=sum(t["prediction_count"] for t in tests), config=cfg.to_dict(),
                        frame_interval_p95_ms=float(np.percentile(intervals, 95)*1000) if intervals else None,
                        long_frame_intervals=sum(t>1.5/cfg.refresh_rate for t in intervals))
         write_json(Path(output)/"summary.json", summary)
         write_json(Path(output)/"events.json", events)
         write_csv(Path(output)/"frames.csv", frames)
         timing.save(output, frames, cfg.refresh_rate, headless=headless)
-        print(f"[Online] Results: {output}\n{json.dumps(accuracy)}", flush=True)
+        print(f"[Online] Results: {output}\n" + json.dumps([
+            dict(method=t["method"], time_accuracy=t["time_accuracy"]) for t in tests]), flush=True)
     return 1 if error else 0
 
 
@@ -704,6 +815,7 @@ def run_replay(cfg, output, eeg_path, state_path, train_segments):
     # Original MAT runs have continuous stimulation; never invent a restart.
     metadata[:, INTENSITY+cfg.task_m] = 1
     metadata[:, INTENSITY+cfg.task_m+1] = states[:, 0]
+    metadata[:, INTENSITY+cfg.task_m+2] = 1
     metadata[:split, STAGE], metadata[split:, STAGE] = TRAIN, ONLINE
     for segment, (start, stop) in enumerate(zip(boundaries[:-1], boundaries[1:])):
         metadata[start:stop, SEGMENT] = segment
@@ -746,10 +858,12 @@ def run_replay(cfg, output, eeg_path, state_path, train_segments):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, help="JSON configuration; see online_config.json")
-    parser.add_argument("--method", choices=METHODS)
+    parser.add_argument("--method", choices=METHODS, help="Single-model MAT replay only; live run tests all three")
     parser.add_argument("--task-m", type=int, choices=(2, 4))
     parser.add_argument("--online-mode", choices=("cued", "uncued"))
     parser.add_argument("--online-seconds", type=float)
+    parser.add_argument("--online-stop-mode", choices=("time", "segments"))
+    parser.add_argument("--online-cue-count", type=int)
     parser.add_argument("--training-blocks", type=int)
     parser.add_argument("--train-cue-seconds", nargs=2, type=float)
     parser.add_argument("--skip-seconds", type=float)
@@ -766,11 +880,14 @@ def main(argv=None):
     parser.add_argument("--replay-train-segments", type=int, default=10)
     args = parser.parse_args(argv)
     cfg = Config(**json.loads(args.config.read_text(encoding="utf-8-sig"))) if args.config else Config()
-    for key in ("method", "task_m", "online_mode", "online_seconds", "training_blocks",
+    for key in ("method", "task_m", "online_mode", "online_seconds", "online_stop_mode",
+                "online_cue_count", "training_blocks",
                 "train_cue_seconds", "skip_seconds", "test_warmup_seconds", "min_samples", "timing_diagnostics"):
         if getattr(args, key) is not None:
             setattr(cfg, key, getattr(args, key))
     cfg.validate()
+    if args.method is not None and not args.replay_eeg:
+        parser.error("--method applies only to MAT replay; a live run tests all three methods")
     if bool(args.replay_eeg) != bool(args.replay_states):
         parser.error("Specify both --replay-eeg and --replay-states")
     if args.headless and not args.simulate:

@@ -147,7 +147,12 @@ class TimingDiagnostics:
                     parts = interval_parts(previous, current)
                     a, b = previous['swap_after'], current['swap_after']
                     anomalies.append(dict(frame=int(current['frame']),
-                        stage=indexed[int(current['frame'])]['stage'], start=a, stop=b,
+                        stage=indexed[int(current['frame'])]['stage'],
+                        test_id=indexed[int(current['frame'])].get('test_id', 0),
+                        method=indexed[int(current['frame'])].get('method'),
+                        previous_test_id=indexed[int(previous['frame'])].get('test_id', 0),
+                        previous_method=indexed[int(previous['frame'])].get('method'),
+                        start=a, stop=b,
                         interval_ms=gap*1000, largest_component=max(parts, key=parts.get),
                         components_ms=parts,
                         overlapping_gc=[i for i,e in enumerate(self.gc_events) if e['start']<b and e['stop']>a],
@@ -159,6 +164,9 @@ class TimingDiagnostics:
             numeric_buffer_bytes=sum(c.nbytes for c in self.chunks),
             gc_event_count=len(self.gc_events), window_event_count=len(self.window_events),
             long_interval_count=len(anomalies),
+            long_interval_count_by_test={str(test_id): sum(
+                a['test_id'] == test_id or a['previous_test_id'] == test_id for a in anomalies)
+                for test_id in sorted({f.get('test_id', 0) for f in frames}) if test_id},
             long_intervals=sorted(anomalies, key=lambda x:x['interval_ms'], reverse=True),
             note='Headless swap_call includes synthetic sleep. GC/window overlap is evidence of coincidence, not proof of cause.')
         (output/'timing_diagnostics_summary.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
