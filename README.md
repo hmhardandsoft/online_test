@@ -1,7 +1,3 @@
-# Online SSVEP
-
-独立的 Windows 在线实验项目，支持 USB8 放大器、2000 Hz EEG、120/600 Hz 主显示器，支持 Aug_FB_LDA、Aug_FB_TRCA、Aug_FB_eTRCA 和 M=2/4。
-
 ## 安装
 
 在本项目目录中执行，需要 uv、Git、可访问 SDK Git 仓库的网络，以及放大器和显卡驱动。
@@ -37,7 +33,6 @@ uv run --locked python .\online_experiment.py --simulate --headless --training-b
 
 ## 文件与 Git
 
-直接运行本目录的 online_experiment.py，不依赖 D 盘位置或原 0710 目录，不使用外层同名转接入口。
 
 - online_core.py：滤波、取窗、模型和时间准确率。
 - SSVEP_stimulator.py、util.py：刺激界面及共享状态。刺激模块仍导入 SSVEP_decoder.py 和 SSVEP_recorder.py，因此随项目保留。
@@ -47,5 +42,3 @@ uv run --locked python .\online_experiment.py --simulate --headless --training-b
 - online_experiment_README.md：完整范式、参数和输出说明。
 
 原始数据、模型、虚拟环境和测试输出由 .gitignore 排除。保留源码、配置、测试、uv.lock 和文档。实际运行参数另外保存于每次结果的 config.json。
-
-本目录作为独立 Git 仓库管理，原 0710 项目保持原样。私有仓库：https://github.com/hmhardandsoft/ssvep_online 。新电脑使用已授权的 GitHub 账号执行 git clone https://github.com/hmhardandsoft/ssvep_online.git，再进入项目目录执行上述 uv 安装命令。
