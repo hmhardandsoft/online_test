@@ -87,5 +87,6 @@
   "max_prediction_lag_seconds": 0.1,
   "fit_timeout_seconds": 45.0,
   "no_data_timeout_seconds": 3.0,
-  "seed": 20261104
+  "seed": 20261104,
+  "timing_diagnostics": true
 }

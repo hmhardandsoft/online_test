@@ -42,3 +42,8 @@ uv run --locked python .\online_experiment.py --simulate --headless --training-b
 - online_experiment_README.md：完整范式、参数和输出说明。
 
 原始数据、模型、虚拟环境和测试输出由 .gitignore 排除。保留源码、配置、测试、uv.lock 和文档。实际运行参数另外保存于每次结果的 config.json。
+
+
+## 刺激停顿定位
+
+默认开启主线程分段计时、垃圾回收和窗口状态记录。使用说明、输出文件及开销测试见 [timing_diagnostics_README.md](timing_diagnostics_README.md)。通过 --no-timing-diagnostics 可关闭新增定位记录。

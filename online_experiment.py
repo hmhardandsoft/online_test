@@ -22,6 +22,7 @@ from scipy.io import savemat, loadmat
 import joblib
 from threadpoolctl import threadpool_limits
 from util import SharedState
+from timing_diagnostics import TimingDiagnostics
 from online_core import (Config, METHODS, WAIT, TRAIN, DRAIN, FIT, CATCHUP, ONLINE, END,
                          WAIT_TEST, WARMUP, FLICKER_STAGES, metadata_columns,
                          STAGES, LABEL, TRAIN_VALID, STAGE, SEGMENT, VALID, INTENSITY,
@@ -441,6 +442,7 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
     completed, error = False, None
     schedule = Schedule(cfg)
     online_end = None
+    timing = TimingDiagnostics(cfg.timing_diagnostics)
     try:
         if not headless:
             import glfw
@@ -448,6 +450,7 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
             stim = graphics.SSVEPStimulator(share, required_refresh_rate=cfg.refresh_rate)
             if stim.refresh_rate != cfg.refresh_rate:
                 raise RuntimeError(f"Display is {stim.refresh_rate} Hz, require {cfg.refresh_rate} Hz")
+        timing.attach(glfw, stim.window if stim else None)
         workers = [mp.Process(target=acquisition_worker, name="online-recorder",
                               args=(share, cfg, str(output), simulate, device_name)),
                    mp.Process(target=decoder_worker, name="online-decoder", args=(share, cfg, str(output)))]
@@ -480,6 +483,7 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
         headless_deadline = time.perf_counter()
         overload_since = None
         while share.is_running.value:
+            timing.begin(frame)
             now = time.perf_counter()
             if share.failed.value or any(not p.is_alive() for p in workers):
                 raise RuntimeError("Worker failed; see worker error JSON")
@@ -505,18 +509,24 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
                     raise RuntimeError("Decoder cannot sustain realtime processing")
             else:
                 overload_since = None
+            timing.mark('control_end')
             label, duration = schedule.cue()
             schedule.next_stimulus_frame()
+            timing.mark('prediction_read_begin')
             with share.prediction_lock:
                 pred = share.predict_label.value if schedule.stage == ONLINE else 0
+            timing.mark('prediction_read_end')
             if stim:
                 intensities = (stim._phase_intensities_for_frame(schedule.stimulus_frame)
                                if schedule.stimulus_id else [0.]*cfg.task_m)
-                draw_frame(stim, graphics, cfg, schedule.stage, label, pred, intensities)
+                draw_frame(stim, graphics, cfg, schedule.stage, label, pred, intensities, timing)
                 swap_before = time.perf_counter()
                 glfw.swap_buffers(stim.window)
                 swapped = time.perf_counter()
+                timing.mark('swap_before', swap_before)
+                timing.mark('swap_after', swapped)
                 glfw.poll_events()
+                timing.mark('poll_end')
             else:
                 # Exact rational phase rule for integer refresh rate and 10 Hz.
                 from fractions import Fraction
@@ -524,10 +534,16 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
                 den = step.denominator*cfg.task_m
                 intensities = ([float(2*((schedule.stimulus_frame*step.numerator*cfg.task_m+i*step.denominator)%den)<den)
                                 for i in range(cfg.task_m)] if schedule.stimulus_id else [0.]*cfg.task_m)
+                timing.mark('draw_begin')
+                timing.mark('draw_end')
+                timing.mark('flush_end')
                 swap_before = time.perf_counter()
                 headless_deadline += 1/cfg.refresh_rate
                 time.sleep(max(0., headless_deadline-time.perf_counter()))
                 swapped = time.perf_counter()
+                timing.mark('swap_before', swap_before)
+                timing.mark('swap_after', swapped)
+                timing.mark('poll_end')
             if schedule.cue_start is None and label:
                 schedule.cue_start = swapped
             if schedule.stage == ONLINE and schedule.online_start is None:
@@ -540,7 +556,9 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
             if schedule.stage != last_stage:
                 schedule.stage_start = swapped
                 print(f"[Stage] {STAGES[schedule.stage]}", flush=True)
+            timing.mark('state_begin')
             present_state(share, cfg, schedule, frame, intensities, swapped)
+            timing.mark('state_end')
             if schedule.stage == DRAIN and last_stage != DRAIN:
                 with share.ring_lock:
                     share.close_idx.value = share.buff_idx.value
@@ -549,12 +567,14 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
                 events.append(dict(time=swapped, stage=STAGES[schedule.stage], segment=schedule.segment,
                                    cue=label, duration_requested=duration, sample_write=share.buff_idx.value,
                                    stimulus_id=schedule.stimulus_id, stimulus_frame=schedule.stimulus_frame))
+            timing.mark('events_end')
             frames.append(dict(frame=frame, swap_before=swap_before, swap_after=swapped,
                 interval=None if previous_swap is None else swapped-previous_swap,
                 stage=STAGES[schedule.stage], segment=schedule.segment, cue=label,
                 stimulus_id=schedule.stimulus_id, stimulus_frame=schedule.stimulus_frame,
                 displayed_prediction=pred if cfg.feedback else 0,
                 intensity=json.dumps(intensities), decoder_backlog_samples=share.buff_idx.value-share.read_idx.value))
+            timing.finish()
             previous_swap, last_stage, previous_segment = swapped, schedule.stage, schedule.segment
             frame += 1
         if share.failed.value:
@@ -563,6 +583,7 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
         error = str(exc) or "Interrupted"
         print(f"[Online] {error}", flush=True)
     finally:
+        timing.detach()
         if stim:
             try:
                 graphics.glClear(graphics.GL_COLOR_BUFFER_BIT)
@@ -622,6 +643,7 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
         write_json(Path(output)/"summary.json", summary)
         write_json(Path(output)/"events.json", events)
         write_csv(Path(output)/"frames.csv", frames)
+        timing.save(output, frames, cfg.refresh_rate, headless=headless)
         print(f"[Online] Results: {output}\n{json.dumps(accuracy)}", flush=True)
     return 1 if error else 0
 
@@ -637,7 +659,9 @@ def draw_prediction(stim, graphics, label):
     graphics.glEnd()
 
 
-def draw_frame(stim, graphics, cfg, stage, label, prediction, intensities):
+def draw_frame(stim, graphics, cfg, stage, label, prediction, intensities, timing=None):
+    if timing is not None:
+        timing.mark('draw_begin')
     graphics.glClear(graphics.GL_COLOR_BUFFER_BIT)
     graphics.glLoadIdentity()
     if stage in FLICKER_STAGES:
@@ -649,7 +673,11 @@ def draw_frame(stim, graphics, cfg, stage, label, prediction, intensities):
             draw_prediction(stim, graphics, prediction)
     elif stage == WAIT_TEST:
         stim._draw_centered_text_5x7("PRESS SPACE TO START", pixel_size=3.)
+    if timing is not None:
+        timing.mark('draw_end')
     graphics.glFlush()
+    if timing is not None:
+        timing.mark('flush_end')
 
 
 def run_replay(cfg, output, eeg_path, state_path, train_segments):
@@ -727,6 +755,8 @@ def main(argv=None):
     parser.add_argument("--skip-seconds", type=float)
     parser.add_argument("--test-warmup-seconds", type=float)
     parser.add_argument("--min-samples", type=int)
+    parser.add_argument("--timing-diagnostics", action=argparse.BooleanOptionalAction, default=None,
+                        help="Main-thread timing, GC and window events (default: enabled)")
     parser.add_argument("--device-name", help="SDK exact amplifier name (not the COM port)")
     parser.add_argument("--simulate", action="store_true", help="Synthetic EEG, no amplifier; not a performance validation")
     parser.add_argument("--headless", action="store_true", help="Synthetic test only; no display")
@@ -737,7 +767,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     cfg = Config(**json.loads(args.config.read_text(encoding="utf-8-sig"))) if args.config else Config()
     for key in ("method", "task_m", "online_mode", "online_seconds", "training_blocks",
-                "train_cue_seconds", "skip_seconds", "test_warmup_seconds", "min_samples"):
+                "train_cue_seconds", "skip_seconds", "test_warmup_seconds", "min_samples", "timing_diagnostics"):
         if getattr(args, key) is not None:
             setattr(cfg, key, getattr(args, key))
     cfg.validate()

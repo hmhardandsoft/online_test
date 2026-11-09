@@ -53,6 +53,7 @@ class Config:
     online_cue_seconds: tuple = (3., 5.)
     test_warmup_seconds: float = .5
     feedback: bool = True
+    timing_diagnostics: bool = True
     refresh_rate: int = 120
     frequency: float = 10.
     ring_seconds: float = 60.
@@ -64,6 +65,8 @@ class Config:
     seed: int = 20261104
 
     def validate(self):
+        if not isinstance(self.timing_diagnostics, bool):
+            raise ValueError("timing_diagnostics must be true or false")
         if self.fs != 2000 or self.task_m not in (2, 4) or self.method not in METHODS:
             raise ValueError("Require FS=2000, M=2/4 and a supported method")
         if self.window_size <= 0 or self.window_size % (2 * self.decimation):
