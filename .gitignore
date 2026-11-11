@@ -12,3 +12,6 @@ Dataset/
 *.npz
 *.joblib
 *.log
+*.etl
+*.etl.*
+render_traces/

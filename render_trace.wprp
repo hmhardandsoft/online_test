@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsPerformanceRecorder Version="1.0" Author="SSVEP">
+  <Profiles>
+    <EventCollector Id="SSVEPCollector" Name="SSVEP render markers">
+      <BufferSize Value="64" />
+      <Buffers Value="16" />
+    </EventCollector>
+    <EventProvider Id="SSVEPMarkers" Name="8c88351d-6ab9-480a-83a3-96a7df776154" Level="5">
+      <Keywords><Keyword Value="0x1" /></Keywords>
+    </EventProvider>
+    <Profile Id="SSVEPRender.Verbose.File" Name="SSVEPRender" Description="SSVEP render clock anchors" LoggingMode="File" DetailLevel="Verbose">
+      <Collectors>
+        <EventCollectorId Value="SSVEPCollector">
+          <EventProviders><EventProviderId Value="SSVEPMarkers" /></EventProviders>
+        </EventCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>
