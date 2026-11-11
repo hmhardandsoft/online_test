@@ -24,6 +24,7 @@ import joblib
 from threadpoolctl import threadpool_limits
 from util import SharedState
 from timing_diagnostics import TimingDiagnostics
+from render_trace import RenderTraceContext
 from online_core import (Config, METHODS, WAIT, TRAIN, DRAIN, FIT, CATCHUP, ONLINE, END,
                          WAIT_TEST, WARMUP, FLICKER_STAGES, metadata_columns,
                          STAGES, LABEL, TRAIN_VALID, STAGE, SEGMENT, VALID, INTENSITY,
@@ -513,6 +514,7 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
     online_end = None
     train_ready_time = train_prompt_time = train_space_accepted_at = None
     timing = TimingDiagnostics(cfg.timing_diagnostics)
+    render_trace = RenderTraceContext(output, enabled=cfg.timing_diagnostics)
     try:
         if not headless:
             import glfw
@@ -520,6 +522,7 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
             stim = graphics.SSVEPStimulator(share, required_refresh_rate=cfg.refresh_rate)
             if stim.refresh_rate != cfg.refresh_rate:
                 raise RuntimeError(f"Display is {stim.refresh_rate} Hz, require {cfg.refresh_rate} Hz")
+        render_trace.display(glfw, stim.window if stim else None)
         timing.attach(glfw, stim.window if stim else None)
         workers = [mp.Process(target=acquisition_worker, name="online-recorder",
                               args=(share, cfg, str(output), simulate, device_name)),
@@ -527,6 +530,9 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
                               args=(share, cfg, str(output), schedule.method_order))]
         for worker in workers:
             worker.start()
+        render_trace.workers(workers)
+        render_trace.anchor('workers_started')
+        render_trace.save()  # Before the initial ready/SPACE screen, never per frame.
         deadline = time.perf_counter()+30
         return_code = None
         train_prompt_visible = False
@@ -678,6 +684,7 @@ def run_live(cfg, output, simulate=False, headless=False, device_name=None):
         error = str(exc) or "Interrupted"
         print(f"[Online] {error}", flush=True)
     finally:
+        render_trace.close()  # After the frame loop; ETW end anchor and metadata only.
         timing.detach()
         if stim:
             try:

@@ -71,6 +71,8 @@ uv run --locked python benchmark_timing_diagnostics.py --frames 100000
 
 # 三段测试的归属
 
+根因定位所需的系统跟踪、进程/线程编号和ETW时间锚点，见 [render_trace_README.md](render_trace_README.md)。现有逐帧诊断继续保留；系统跟踪通过独立脚本显式开启。
+
 新版 `frames.csv` 与 `events.json` 含 `test_id`、`method`；`predictions.json` 还记录触发窗口所属的测试编号和算法。`timing_diagnostics_summary.json` 的长帧间隔同时含当前帧和前一帧的 `test_id`/`method`，并给出 `long_interval_count_by_test`。段间切黑帧可能属于 `test_id=0`，所以定位跨边界停顿时应查看 `previous_test_id`。记录仍按全局帧号关联，不会因每段刺激局部帧号重置而冲突。
 
 # 绘制步骤与主线程 CPU 时间（记录格式 v2）
