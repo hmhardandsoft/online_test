@@ -9,10 +9,14 @@ from pathlib import Path
 import numpy as np
 
 
-COLUMNS = ('frame', 'loop_start', 'control_end', 'prediction_read_begin',
+BASE_COLUMNS = ('frame', 'loop_start', 'control_end', 'prediction_read_begin',
            'prediction_read_end', 'draw_begin', 'draw_end', 'flush_end',
            'swap_before', 'swap_after', 'poll_end', 'state_begin', 'state_end',
            'events_end', 'frame_log_end', 'diagnostic_end')
+DRAW_STEPS = ('clear_end', 'identity_end', 'target_1_end', 'target_2_end',
+              'target_3_end', 'target_4_end', 'cue_end', 'feedback_end', 'prompt_end')
+# Optional columns are appended: M2, black screens and headless frames have NaNs.
+COLUMNS = BASE_COLUMNS + DRAW_STEPS + ('draw_cpu_start', 'draw_cpu_end')
 INDEX = {name: i for i, name in enumerate(COLUMNS)}
 
 
@@ -39,6 +43,27 @@ def interval_parts(previous, current):
     return {name: (b-a)*1000 for name, a, b in spans}
 
 
+def draw_details(current):
+    """Host call spans, including Python/probe gaps; not GPU execution timings."""
+    start, end = current['draw_begin'], current['draw_end']
+    steps = [(name, current.get(name, float('nan'))) for name in DRAW_STEPS]
+    steps = [(name, value) for name, value in steps if np.isfinite(value)]
+    parts, previous = {}, start
+    for name, value in steps:
+        parts[name.removesuffix('_end')] = (value-previous)*1000
+        previous = value
+    if steps:
+        parts['draw_tail'] = (end-previous)*1000
+    cpu_start = current.get('draw_cpu_start', float('nan'))
+    cpu_end = current.get('draw_cpu_end', float('nan'))
+    cpu_ms = (cpu_end-cpu_start)*1000 if np.isfinite([cpu_start, cpu_end]).all() else None
+    wall_ms = (end-start)*1000
+    return dict(draw_components_ms=parts,
+                largest_draw_component=max(parts, key=parts.get) if parts else None,
+                draw_wall_ms=wall_ms, draw_cpu_ms=cpu_ms,
+                draw_cpu_fraction=cpu_ms/wall_ms if cpu_ms is not None and wall_ms > 0 else None)
+
+
 class TimingDiagnostics:
     def __init__(self, enabled=True, chunk_frames=8192):
         self.enabled = enabled
@@ -53,6 +78,9 @@ class TimingDiagnostics:
         self.attached = False
         self.window_callbacks = []
         self._gc_callback = self._on_gc  # Stable identity for remove().
+        self.draw_thread_id = None
+        self.clock_info = ({name: vars(time.get_clock_info(name))
+                            for name in ('perf_counter', 'thread_time')} if enabled else {})
 
     def begin(self, frame):
         if not self.enabled:
@@ -69,6 +97,19 @@ class TimingDiagnostics:
     def mark(self, name, timestamp=None):
         if self.enabled and self.row is not None:
             self.row[INDEX[name]] = time.perf_counter() if timestamp is None else timestamp
+
+    def begin_draw(self):
+        if self.enabled and self.row is not None:
+            if self.draw_thread_id is None:
+                self.draw_thread_id = threading.get_native_id()
+            # CPU readings enclose the wall interval and a small amount of probe work.
+            self.row[INDEX['draw_cpu_start']] = time.thread_time()
+            self.mark('draw_begin')
+
+    def end_draw(self):
+        if self.enabled and self.row is not None:
+            self.mark('draw_end')
+            self.row[INDEX['draw_cpu_end']] = time.thread_time()
 
     def finish(self):
         self.mark('frame_log_end')
@@ -134,12 +175,14 @@ class TimingDiagnostics:
             (output/filename).write_text(json.dumps(data, indent=2), encoding='utf-8')
         indexed = {f['frame']: f for f in frames}
         anomalies = []
+        complete_rows = 0
         previous = None
         for n in range(self.count):
             row = self.chunks[n//self.chunk_frames][n % self.chunk_frames]
-            if not np.isfinite(row).all():
+            if not np.isfinite(row[:len(BASE_COLUMNS)]).all() or int(row[0]) not in indexed:
                 previous = None
                 continue
+            complete_rows += 1
             current = dict(zip(COLUMNS, row))
             if previous is not None:
                 gap = current['swap_after']-previous['swap_after']
@@ -155,12 +198,15 @@ class TimingDiagnostics:
                         start=a, stop=b,
                         interval_ms=gap*1000, largest_component=max(parts, key=parts.get),
                         components_ms=parts,
+                        **draw_details(current),
                         overlapping_gc=[i for i,e in enumerate(self.gc_events) if e['start']<b and e['stop']>a],
                         nearby_window_events=[i for i,e in enumerate(self.window_events) if a-.05<=e['time']<=b+.05]))
             previous = current
-        result = dict(enabled=True, headless=headless, clock='time.perf_counter seconds',
+        result = dict(enabled=True, schema_version=2, headless=headless, clock='time.perf_counter seconds',
+            clock_info=self.clock_info, draw_thread_native_id=self.draw_thread_id,
             scope='main process only; elapsed time includes waiting and OS scheduling',
             threshold_ms=1500/refresh_rate, frame_rows=self.count, presented_frames=len(frames),
+            complete_frame_rows=complete_rows, incomplete_frame_rows=self.count-complete_rows,
             numeric_buffer_bytes=sum(c.nbytes for c in self.chunks),
             gc_event_count=len(self.gc_events), window_event_count=len(self.window_events),
             long_interval_count=len(anomalies),
@@ -168,5 +214,10 @@ class TimingDiagnostics:
                 a['test_id'] == test_id or a['previous_test_id'] == test_id for a in anomalies)
                 for test_id in sorted({f.get('test_id', 0) for f in frames}) if test_id},
             long_intervals=sorted(anomalies, key=lambda x:x['interval_ms'], reverse=True),
-            note='Headless swap_call includes synthetic sleep. GC/window overlap is evidence of coincidence, not proof of cause.')
+            note=('Draw components subdivide draw_commands; do not add both totals. '
+                  'CPU time covers draw_begin..draw_end plus probe overhead, excluding glFlush/swap. '
+                  'Clock precision is platform dependent; short CPU deltas may be zero. '
+                  'Low CPU use does not distinguish driver blocking from OS descheduling. '
+                  'Headless frames have no detailed GL/CPU measurements; swap includes synthetic sleep. '
+                  'GC/window overlap indicates coincidence, not proof of cause.'))
         (output/'timing_diagnostics_summary.json').write_text(json.dumps(result, indent=2), encoding='utf-8')

@@ -6,12 +6,12 @@ import time
 from pathlib import Path
 
 import numpy as np
-from timing_diagnostics import TimingDiagnostics, COLUMNS
+from timing_diagnostics import TimingDiagnostics, BASE_COLUMNS
 
 
 def run(mode, count):
     frames=[]
-    d=TimingDiagnostics(mode=='enabled')
+    d=TimingDiagnostics(mode in ('enabled', 'coarse'))
     gc.collect()
     d.attach()
     elapsed=np.empty(count)
@@ -20,7 +20,21 @@ def run(mode, count):
         t=time.perf_counter()
         if mode!='legacy':
             d.begin(i)
-            for name in COLUMNS[2:-2]:d.mark(name)
+            if mode == 'coarse':
+                # Same base clock reads as the previous version, using the new buffer layout.
+                for name in BASE_COLUMNS[2:-2]:d.mark(name)
+            else:
+                for name in ('control_end', 'prediction_read_begin', 'prediction_read_end'):
+                    d.mark(name)
+                if d.enabled:
+                    d.begin_draw()
+                    for name in ('clear_end', 'identity_end', 'target_1_end', 'target_2_end',
+                                 'target_3_end', 'target_4_end', 'cue_end'):
+                        d.mark(name)
+                    d.end_draw()
+                    d.mark('flush_end')
+                for name in ('swap_before', 'swap_after', 'poll_end', 'state_begin', 'state_end', 'events_end'):
+                    d.mark(name)
         # Same allocation/serialization pattern as the existing frame log.
         frames.append(dict(frame=i,swap_before=t,swap_after=t,interval=1/600,
             stage='training',segment=1,cue=1,stimulus_id=1,stimulus_frame=i,
@@ -41,8 +55,9 @@ if __name__=='__main__':
     parser.add_argument('--output',type=Path,default=Path('online_results/timing_probe_overhead.json'))
     args=parser.parse_args()
     results=[]
-    for mode in ('legacy','enabled','disabled','disabled','enabled','legacy'):
+    for mode in ('legacy','coarse','enabled','disabled','disabled','enabled','coarse','legacy'):
         r=run(mode,args.frames);results.append(r);print(json.dumps(r),flush=True)
     args.output.parent.mkdir(parents=True,exist_ok=True)
     args.output.write_text(json.dumps(dict(scope='Recording-only CPU/memory benchmark; no hardware or display',
+                                         coarse_baseline='Base probes only, using the expanded buffer layout',
                                          runs=results),indent=2),encoding='utf-8')

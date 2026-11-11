@@ -65,9 +65,32 @@ uv run --locked python -m unittest test_online_experiment test_timing_diagnostic
 uv run --locked python benchmark_timing_diagnostics.py --frames 100000
 ```
 
-本次验证：18项单元测试通过；新建600 Hz计划节奏的合成流程在开启/关闭两种配置下均完成训练、冻结、等待、缓冲与online，各发布78条预测；开启时4287个已呈现帧与定位记录逐行匹配，长间隔分段之和一致。没有运行真实放大器或物理600 Hz显示器。
+初版定位记录的验证：18项单元测试通过；600 Hz计划节奏的合成流程在开启/关闭两种配置下均完成训练、冻结、等待、缓冲与online，各发布78条预测；开启时4287个已呈现帧与定位记录逐行匹配，长间隔分段之和一致。没有运行真实放大器或物理600 Hz显示器。
 
 目前只增加定位信息，尚未根据长帧自动排除训练窗口。可先积累异常及其归因证据，再单独确定质量阈值和保护规则。
+
 # 三段测试的归属
 
 新版 `frames.csv` 与 `events.json` 含 `test_id`、`method`；`predictions.json` 还记录触发窗口所属的测试编号和算法。`timing_diagnostics_summary.json` 的长帧间隔同时含当前帧和前一帧的 `test_id`/`method`，并给出 `long_interval_count_by_test`。段间切黑帧可能属于 `test_id=0`，所以定位跨边界停顿时应查看 `previous_test_id`。记录仍按全局帧号关联，不会因每段刺激局部帧号重置而冲突。
+
+# 绘制步骤与主线程 CPU 时间（记录格式 v2）
+
+`timing_diagnostics=true` 时，`frame_timing.csv` 在原有列之后增加：
+
+- `clear_end`、`identity_end`：`glClear` 与 `glLoadIdentity` 返回后的主机时间。
+- `target_1_end` 至 `target_4_end`：各目标绘制返回后的时间；M2 的后两列留空。
+- `cue_end`、`feedback_end`、`prompt_end`：提示标记、预测反馈、空格提示文字绘制返回后的时间。未执行的步骤留空。
+- `draw_cpu_start`、`draw_cpu_end`：在刺激主线程读取的 `time.thread_time()` 累计 CPU 秒数。两者之差覆盖整个绘制区间及少量测量开销，不含 `glFlush` 和交换缓冲。
+
+原有 `draw_begin` 至 `draw_end` 仍表示整个绘制调用范围。各子步骤使用相邻时间点相减，包含调用间少量 Python 控制与测量开销；这些数据测量主机调用返回耗时，不是显卡执行耗时。绘图命令和调用顺序保持原样，没有增加强制 GPU 同步。
+
+`timing_diagnostics_summary.json` 的每个长间隔新增 `draw_components_ms`、`largest_draw_component`、`draw_wall_ms`、`draw_cpu_ms`、`draw_cpu_fraction`。子步骤加上 `draw_tail` 的和等于该帧的 `draw_commands`，不能再把子步骤与整体重复相加。如果长间隔实际出现在前一帧日志或当前交换缓冲，应优先看原有 `largest_component`；新增绘制数据只描述当前帧。
+
+若绘制实际经过 58 ms，线程 CPU 只增加很少，说明期间该线程没有持续消耗 CPU；仍不能直接区分驱动等待和 Windows 暂停调度。CPU 时间较大也可能包含底层库或驱动忙等待，不能直接归因为 Python 算法。系统时钟的精度会影响短区间的 CPU 差值；零值不能作为“没有计算”的证据，比例也不做强制截断或自动归因。
+
+汇总保存 `clock_info`（时钟实现、报告分辨率等）和 `draw_thread_native_id`，供后续系统线程跟踪使用。`--headless` 没有真实 GL 绘制，因此这些子步骤及 CPU 字段留空；不会伪造 GPU 测量。未执行步骤不影响正常帧纳入汇总；退出循环时已开始但未完成的帧计入 `incomplete_frame_rows`。
+
+测量值仍写入分块预分配的数值内存，停止实验后统一保存。关闭原有 `--no-timing-diagnostics` 开关也会关闭新增时钟读取。M4 每个真实绘制帧增加约 7 次实际时钟读取和 2 次线程 CPU 时钟读取；包含预测反馈时再增加一次。27 列缓冲在 600 Hz、5 分钟下约占 37 MiB，实际按 8192 帧分块分配。
+
+运行 `benchmark_timing_diagnostics.py` 可比较 `legacy`（仅原有帧日志）、`coarse`（原分段时钟读取，使用新版缓冲布局）、`enabled`（增加细分与 CPU 记录）、`disabled`。这是纯记录开销检查；真实显示器上的最大帧间隔仍需在相同 600 Hz/M4 条件下对照测量。
+本轮验证：24 项单元测试通过；M4 合成三段测试完成，7721 帧与完整计时记录逐行匹配，发布 139 个预测。每模式两轮、每轮 100000 帧的纯记录基准中，`coarse` 的 P95 为 4.5–4.6 微秒，`enabled` 为 5.7–5.8 微秒，约增加 1.2 微秒/帧。这个差值是本机记录开销测量，不是实际 600 Hz 显示器上的卡顿改善结果。

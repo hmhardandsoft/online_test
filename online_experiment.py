@@ -771,23 +771,36 @@ def draw_prediction(stim, graphics, label):
 
 
 def draw_frame(stim, graphics, cfg, stage, label, prediction, intensities, timing=None):
-    if timing is not None:
-        timing.mark('draw_begin')
+    profile = timing is not None and timing.enabled
+    if profile:
+        timing.begin_draw()
     graphics.glClear(graphics.GL_COLOR_BUFFER_BIT)
+    if profile:
+        timing.mark('clear_end')
     graphics.glLoadIdentity()
+    if profile:
+        timing.mark('identity_end')
     if stage in FLICKER_STAGES:
-        for position, intensity in zip(stim.positions, intensities):
+        for target, (position, intensity) in enumerate(zip(stim.positions, intensities)):
             stim._draw_target_square(position, intensity)
+            if profile:
+                timing.mark(('target_1_end', 'target_2_end', 'target_3_end', 'target_4_end')[target])
         if label:
             stim._draw_cue(label)
+            if profile:
+                timing.mark('cue_end')
         if stage == ONLINE and cfg.feedback and prediction:
             draw_prediction(stim, graphics, prediction)
+            if profile:
+                timing.mark('feedback_end')
     elif stage == WAIT_TEST:
         stim._draw_centered_text_5x7("PRESS SPACE TO START", pixel_size=3.)
-    if timing is not None:
-        timing.mark('draw_end')
+        if profile:
+            timing.mark('prompt_end')
+    if profile:
+        timing.end_draw()
     graphics.glFlush()
-    if timing is not None:
+    if profile:
         timing.mark('flush_end')
 
 
